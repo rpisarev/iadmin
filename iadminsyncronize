@@ -1,0 +1,588 @@
+#!/usr/bin/suidperl
+#     IAdmin
+#	Copyright (C) 2008   Maxim "aka" Decoy Filenko, Ruslan Pisarev
+#	Copyright (c) 2008-2010, Ruslan Pisarev
+#
+#Permission is hereby granted, free of charge, to any person
+#obtaining a copy of this software and associated documentation
+#files (the "Software"), to deal in the Software without
+#restriction, including without limitation the rights to use,
+#copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the
+#Software is furnished to do so, subject to the following
+#conditions:
+#
+#The above copyright notice and this permission notice shall be
+#included in all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+#OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+#WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+#OTHER DEALINGS IN THE SOFTWARE.
+
+use DBI;
+use IAdmin;
+use Proc::ProcessTable;
+#$ENV{PATH} = '/bin:/sbin:/usr/bin:/usr/sbin';
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+$ENV{'PATH'}='/bin:/usr/bin';
+$< = $>;
+$proc_name=$0;
+my $lock="/var/lock/iadminsync";
+if (-e $lock) {
+    open (LCK,"<$lock");
+    $pid=<LCK>;
+    close (LCK);
+
+ $FORMAT = "%-6s %-10s %-8s %-24s %s\n";
+ $t = new Proc::ProcessTable;
+ $alr_run=0;
+ foreach $p ( @{$t->table} ){
+	#print $p->cmndline." --- $proc_name\n";
+ 	if ($p->pid!=$pid) {next;}
+ 	if ($p->cmndline =~ /$proc_name/) { $alr_run=1;break;}
+ }
+    if($alr_run){
+	print "Error code:-1\n";
+	exit;
+    }
+} 
+open (LCK,">$lock");
+print LCK $$."\n";
+close (LCK);
+
+my $bdate = `date +%F_%T`;
+chop($bdate);
+
+
+my $extip = '77.222.333.33';
+
+my $db_name='iadmin';
+my $db_user='iadmin';
+my $db_pass='Secret1';
+
+system("mysqldump -u $db_user -p$db_pass $db_name | gzip -9 >/opt/iadmin/backups/$bdate.sql.gz");
+
+my $dbh = DBI->connect("DBI:mysql:host=localhost;database=".$db_name,$db_user,$db_pass,{PrintError => 0, RaiseError => 1});
+
+open (LOG,">>/var/log/iadminsyncronize.log");
+print LOG "IAdmin Sync started at ".`date`;
+
+my $restartApache=0;
+my $restartPostfix=0;
+my $restartBind=0;
+
+
+$backup_tmp="/tmp/backup.cpio";
+open (CPIO,"|cpio -ocBv > $backup_tmp");
+print CPIO "/var/lock/iadminsync";
+close (CPIO);
+
+sub backup(@_){
+    open (CPIO,"|cpio -ocBvA -O $backup_tmp 2> /dev/null");
+    foreach (@_) {
+	print CPIO $_."\n";
+    }
+    close (CPIO);
+}
+
+sub make_hosts_conf{
+    my $qwe = $dbh->prepare("SELECT sitename,stat_passwd FROM http WHERE enable>=1 ORDER BY sitename;");
+    my $updatepass = $dbh->prepare("UPDATE http SET stat_passwd=? WHERE (enable>=1) AND (sitename=?);"); 
+    $qwe->execute();
+    while (my @val = $qwe->fetchrow_array()){
+	my $sitename = $val[0];
+	my $stat_passwd = $val[1];
+	my $fl=0;
+	
+	if ($stat_passwd =~ /^$/ ){ 
+	    $stat_passwd=passgen(10);
+	    $updatepass->execute($stat_passwd,$sitename);
+	    $fl=1;
+	}
+	$sitename =~ s/[\.\\\-]/_/g;
+	#print LOG "$sitename $stat_passwd\n";
+	print LOG `htpasswd -b /var/www/vhosts/.htpasswd $sitename $stat_passwd 2>&1`;
+	
+    }    
+}
+
+sub make_vhosts_conf{
+    #backup("/etc/apache2/conf/vhosts.conf");
+    `cp /etc/apache2/sites-enabled/vhosts.conf /tmp/vhosts.conf`;
+    open (VHOSTCONF,">/etc/apache2/sites-enabled/vhosts.conf");
+    $qwe = $dbh->prepare
+	("SELECT sitename,path,aliases,additionaloptions,username,(sitename != 'idea2.net') as isidea FROM http 
+		WHERE enable>=1 and additionaloptions<>1 ORDER BY isidea,sitename;");
+    $qwe->execute();
+    print LOG "Creating vhostw.conf\n";
+    print VHOSTCONF "NameVirtualHost *:80\n";
+    print VHOSTCONF "NameVirtualHost *:443\n\n";
+    while (my @val = $qwe->fetchrow_array()){
+	my $name = $val[0];
+	my $nameForPath = $val[1];
+	my $aliases = $val[2];
+	my $options = $val[3];
+	my $username = $val[4];
+	my $myaliases = " www.$name ww.$name wwww.$name";
+	my $mysaliases = " www.$name:443";
+	foreach (split / /, $aliases){
+	    $myaliases = "$myaliases $_ www.$_";
+	    $mysaliases = "$mysaliases $_:443 www.$_:443";
+	}
+        print LOG "VHost: $name\n";
+	print VHOSTCONF
+"#$name
+<VirtualHost *:80>
+    ServerAdmin webmaster\@$name
+    DocumentRoot /var/www/vhosts/$nameForPath/www
+    ServerName $name
+    ServerAlias $myaliases
+    <Directory /var/www/vhosts/$nameForPath/www>
+        AllowOverride all
+    </Directory>
+#    $options
+    ErrorLog /var/www/vhosts/$nameForPath/logs/error_log
+    CustomLog /var/www/vhosts/$nameForPath/logs/access_log combined
+</VirtualHost>\n
+";	
+
+	print VHOSTCONF
+"#$name
+<VirtualHost *:443>
+    SSLEngine on
+    SSLCertificateKeyFile /etc/apache2/ssl/cert.key
+    SSLCertificateFile /etc/apache2/ssl/cert.cert
+    SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP
+
+    ServerAdmin webmaster\@$name
+    DocumentRoot /var/www/vhosts/$nameForPath/www
+    ServerName $name:443
+    ServerAlias $myaliases
+    <Directory /var/www/vhosts/$nameForPath/www>
+        AllowOverride all
+    </Directory>
+#    $options
+    ErrorLog /var/www/vhosts/$nameForPath/logs/ssl_error_log
+    CustomLog /var/www/vhosts/$nameForPath/logs/ssl_access_log combined
+</VirtualHost>\n
+";	
+    #print "chown $username.www-data -R -c '/var/www/vhosts/$nameForPath'\n";
+    print LOG `chown $username.www-data -R -c '/var/www/vhosts/$nameForPath'`;
+    }
+    close(VHOSTCONF);
+    $restartApache=1;
+    print LOG "Done\n";
+}
+
+sub make_vhosts_conf_alias{
+    #backup("/etc/apache2/conf/vhosts.conf");
+	`cp /etc/apache2/sites-aliases/vhosts.conf /tmp/vhosts.conf`;
+    	open (VHOSTCONF,">/etc/apache2/sites-aliases/vhosts.conf");
+    	$qwe = $dbh->prepare
+		("SELECT sitename,path,aliases,additionaloptions,username,(sitename != 'idea2.net') as isidea FROM http 
+			WHERE enable =1 and additionaloptions=1 ORDER BY isidea,sitename;");
+    $qwe->execute();
+    print LOG "Creating vhostw.conf\n";
+#    print VHOSTCONF "#NameVirtualHost *:80\n";
+#    print VHOSTCONF "#NameVirtualHost *:443\n\n";
+    while (my @val = $qwe->fetchrow_array()){
+        my $name = $val[0];
+        my $nameForPath = $val[1];
+        my $aliases = $val[2];
+        my $options = $val[3];
+        my $username = $val[4];
+        my $myaliases = " www.$name ww.$name wwww.$name";
+        my $mysaliases = " www.$name:443";
+        foreach (split / /, $aliases){
+            $myaliases = "$myaliases $_ www.$_";
+            $mysaliases = "$mysaliases $_:443 www.$_:443";
+        }
+
+        print LOG "VHost: $name\n";
+        print VHOSTCONF
+"#$name
+<VirtualHost *:80>
+    ServerAdmin webmaster\@$name
+    DocumentRoot /var/www/vhosts/$nameForPath/www
+    ServerName $name
+    ServerAlias $myaliases
+    <Directory /var/www/vhosts/$nameForPath/www>
+        AllowOverride all
+    </Directory>
+#    $options
+    ErrorLog /var/www/vhosts/$nameForPath/logs/error_log
+    CustomLog /var/www/vhosts/$nameForPath/logs/access_log combined
+</VirtualHost>\n
+";
+ print VHOSTCONF
+"#$name
+<VirtualHost *:443>
+    SSLEngine on
+    SSLCertificateKeyFile /etc/apache2/ssl/cert.key
+    SSLCertificateFile /etc/apache2/ssl/cert.cert
+    SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP
+
+    ServerAdmin webmaster\@$name
+    DocumentRoot /var/www/vhosts/$nameForPath/www
+    ServerName $name:443
+    ServerAlias $myaliases
+    <Directory /var/www/vhosts/$nameForPath/www>
+        AllowOverride all
+    </Directory>
+#    $options
+    ErrorLog /var/www/vhosts/$nameForPath/logs/ssl_error_log
+    CustomLog /var/www/vhosts/$nameForPath/logs/ssl_access_log combined
+</VirtualHost>\n
+";
+    #print "chown $username.www-data -R -c '/var/www/vhosts/$nameForPath'\n";
+     print LOG `chown $username.www-data -R -c '/var/www/vhosts/$nameForPath'`;
+     }
+     close(VHOSTCONF);
+    $restartApache=1;
+    print LOG "Done\n";
+ }
+
+sub sync_passwd_http{
+
+#Add users for vhosts markered as 'new'
+    $qwe = $dbh->prepare("SELECT username,sitename,path FROM http WHERE (enable>=1) AND (status='new')  ORDER BY sitename;");
+    $qwe->execute();
+    while (my @val = $qwe->fetchrow_array()){
+	my $username=$val[0];
+	my $sitename=$val[1];
+	my $path    =$val[2];
+	my $userexists = 0;
+	open (PASSWD, "</etc/passwd");
+	while (<PASSWD>){ if (/$username:([^:]+):([^:]+)/) { $userexists = 1 }; }
+	close (PASSWD);    
+	if ($userexists == 0){
+	    print LOG "Adding user $username\n";
+	    `/usr/sbin/useradd -c '$sitename' -d '/var/www/vhosts/$path/' -g www-data -s /bin/false $username`;
+	}
+	mkdir "/var/www/vhosts/$path/www";
+	mkdir "/var/www/vhosts/$path/logs";
+        mkdir "/var/www/vhosts/$path/arc";
+    }
+    $qwe = $dbh->prepare("UPDATE http SET status='' WHERE (enable>=1) AND (status='new');"); $qwe->execute();
+#Delete user vhosts markered as 'delete'
+    $qwe = $dbh->prepare("SELECT username FROM http WHERE (status='delete');");
+    $qwe->execute();    
+    while (my @val = $qwe->fetchrow_array()){
+	my $username=$val[0];
+	my $sitename=$val[1];
+	my $path    =$val[2];
+	my $userexists = 0;
+	open (PASSWD, "</etc/passwd");
+	while (<PASSWD>){ if (/$username:([^:]+):([^:]+)/) { $userexists = 1 }; }
+	close (PASSWD);    
+	if ($userexists == 1){
+	    print LOG "Deleting user $username\n";
+	    `userdel -r $username`;
+	}
+	$sitename =~ s/[\.\\\-]/_/g;
+	print LOG `htpasswd -b /var/www/vhosts/.htpasswd -D $sitename  2>&1`;
+    }
+    $qwe = $dbh->prepare("DELETE FROM http WHERE status='delete';"); $qwe->execute();
+}
+
+
+sub rotate_mail{
+    $qwe = $dbh->prepare("SELECT domain FROM transport WHERE transport LIKE 'virtual';");
+    $qwe->execute();
+    while (my @val = $qwe->fetchrow_array()){
+	my $domain=$val[0];
+	$subqwe = $dbh->prepare
+		("SELECT COUNT(*) FROM users 
+			WHERE RIGHT(email,LENGTH(email)-LOCATE('\@',email)) LIKE '".$domain."';"); $subqwe->execute();
+	my @val = $subqwe->fetchrow_array();
+	if ($val[0]==0) {
+	    print LOG "Deleting unused transport $domain\n";
+	    $subqwe = $dbh->prepare("DELETE FROM transport WHERE domain LIKE '".$domain."';"); $subqwe->execute();
+	}
+    }
+    $qwe = $dbh->prepare("SELECT RIGHT(email,LENGTH(email)-LOCATE('\@',email)) as domain FROM users WHERE enabled >= 1 GROUP BY domain;");
+    $qwe->execute();
+        while (my @val = $qwe->fetchrow_array()){
+		my $domain=$val[0];
+		#mkdir "/var/spool/mail/$domain/";	
+		#print LOG `chmod 0775 -c /var/spool/mail/$domain`;    
+		$subqwe = $dbh->prepare("INSERT IGNORE INTO transport VALUES ('".$domain."','virtual') ;"); $subqwe->execute();
+    	}
+    #print LOG `chown root.mail -R -c /var/spool/mail`;
+    #print LOG `chmod 0775      -R -c /var/spool/mail`;
+    $qwe = $dbh->prepare("SELECT email FROM users");
+    $qwe->execute();
+    while (my @val = $qwe->fetchrow_array()){
+        my $mbox=$val[0];
+        mkdir "/var/spool/mail/$mbox/";
+        print LOG `chmod 0700 -c /var/spool/mail/$mbox`;
+    }
+    print LOG `chown mail.mail -c /var/spool/mail/*`;
+    print LOG `chmod 0700      -c /var/spool/mail/*`;
+    $restartPostfix=1;
+}
+
+sub sync_dns_files{
+    my $named_conf_inc="/etc/bind/named.conf.local";
+    my $named_conf_slave_inc="/opt/office_bind_conf/named.conf.local";
+    my $named_zones_path="/var/cache/bind";
+    backup($named_conf_inc);
+    backup($named_conf_slave_inc);
+    open (NAMED_CNF,">$named_conf_inc");
+    open (NAMED_CNF_SL,">$named_conf_slave_inc");
+    $dns_dom = $dbh->prepare
+	("SELECT domainname,www,ftp,mail,hosted_on,serial,secondaryfor,typemail,owner FROM dns_domains 
+		WHERE (enable>=1) ORDER BY secondaryfor,domainname;");
+    $dns_dom->execute();
+    while (my @val = $dns_dom->fetchrow_array()){
+
+	my $domainname = $val[0];
+	my $www = $val[1];    
+	my $ftp = $val[2];    
+	my $mail = $val[3];    
+	my $hostedon = $val[4];    
+	my $serial = $val[5];
+	my $secondaryfor = $val[6];
+	my $typemail = $val [7]; # 'our' - почта наша, 'gmail' - на основе google apps
+	my $lang = $val [8]; # если $lang=1, то используются английские NS, иначе стандарные
+	$dns_r = $dbh->prepare("SELECT COUNT(*) FROM dns_records WHERE domainname=? AND rectype='A';");
+        $dns_r->execute('.'.$domainname);
+	my @val = $dns_r->fetchrow_array();
+	my $setdef=$val[0];
+	if ($secondaryfor =~ /[0-9\.]+/){
+	    print NAMED_CNF
+"
+zone \"$domainname\" IN {
+\ttype slave;
+\tmasters {
+\t\t$secondaryfor;
+\t};
+\tfile \"/var/cache/bind/$domainname.zone\";
+\tallow-query { all; };
+\tallow-transfer { secondary; };
+};						
+";
+
+print NAMED_CNF_SL
+"zone \"$domainname\" IN {
+\ttype slave;
+\tmasters {
+\t\t$secondaryfor;
+\t};
+\tfile \"$domainname.zone\";
+\tallow-query {
+\t\tany;
+\t};
+};
+
+";
+	} else {
+	    print NAMED_CNF
+"zone \"$domainname\" IN {
+\ttype master;
+\tfile \"$domainname.zone\";
+\tallow-query { all; };
+\tallow-transfer { secondary; };
+};
+
+";
+	    print NAMED_CNF_SL
+"zone \"$domainname\" IN {
+\ttype slave;
+\tmasters {
+\t\t$extip ;
+\t};
+\tfile \"$domainname.zone\";
+\tallow-query {
+\t\tany;
+\t};
+};
+
+";
+	    #backup("$named_zones_path/$domainname.zone");
+	    `cp $named_zones_path/$domainname.zone /tmp/$domainname.zone`;
+	    open (DZONE,">$named_zones_path/$domainname.zone");
+	if ($lang==0){	
+	    print DZONE
+"\$TTL 86400
+$domainname.     IN      SOA     ns0.rus.com. ns1.rus.com. (
+                $serial      ; serial
+                10800           ; refresh
+                3600            ; retry
+                604800          ; expire
+                86400 )         ; minimum
+    		IN      NS      ns0.rus.com.
+    		IN      NS      ns1.rus.com.\n";} else {
+	print DZONE
+"\$TTL 86400
+$domainname.     IN      SOA     ns0.english.com. ns1.english.com. (
+                $serial      ; serial
+                10800           ; refresh
+                3600            ; retry
+                604800          ; expire
+                86400 )         ; minimum
+                IN      NS      ns0.english.com.
+                IN      NS      ns1.english.com.\n";	
+		} 
+		
+	    if ($setdef==0){
+		print DZONE "		IN      A       $hostedon\n";
+		
+	    }
+
+	if ($typemail eq "our") {
+		if ($mail==1){
+ print DZONE
+"                IN      MX      1 relay.$domainname.
+relay           IN      A       $extip\n";
+            	}
+	}
+#	    if ($mail>0) { print DZONE
+#"    		IN	MX	1 relay.$domainname.
+#relay           IN	A	$extip\n";
+#	    }
+
+	if ($typemail eq "gmail"){
+		if ($mail==1){
+print DZONE
+";               IN      MX      1 relay.$domainname.
+;relay           IN      A       $extip
+                IN      MX      1 ASPMX.L.GOOGLE.COM.
+                IN      MX      5 ALT1.ASPMX.L.GOOGLE.COM.
+                IN      MX      5 ALT2.ASPMX.L.GOOGLE.COM.
+                IN      MX      10 ASPMX2.GOOGLEMAIL.COM.
+                IN      MX      10 ASPMX3.GOOGLEMAIL.COM.
+                IN      MX      10 ASPMX4.GOOGLEMAIL.COM.
+                IN      MX      10 ASPMX5.GOOGLEMAIL.COM.
+                IN      TXT     \"v=spf1 include:aspmx.googlemail.com ~all\"
+mail            IN      CNAME   ghs.google.com.
+calendar        IN      CNAME   ghs.google.com.
+start           IN      CNAME   ghs.google.com.
+docs            IN      CNAME   ghs.google.com.
+_xmpp-server._tcp.$domainname. IN SRV 5 0 5269 xmpp-server.l.google.com.
+_xmpp-server._tcp.$domainname. IN SRV 20 0 5269 xmpp-server1.l.google.com.
+_xmpp-server._tcp.$domainname. IN SRV 20 0 5269 xmpp-server2.l.google.com.
+_xmpp-server._tcp.$domainname. IN SRV 20 0 5269 xmpp-server3.l.google.com.
+_xmpp-server._tcp.$domainname. IN SRV 20 0 5269 xmpp-server4.l.google.com.
+_jabber._tcp.$domainname. IN SRV 5 0 5269 xmpp-server.l.google.com.
+_jabber._tcp.$domainname. IN SRV 20 0 5269 xmpp-server1.l.google.com.
+_jabber._tcp.$domainname. IN SRV 20 0 5269 xmpp-server2.l.google.com.
+_jabber._tcp.$domainname. IN SRV 20 0 5269 xmpp-server3.l.google.com.
+_jabber._tcp.$domainname. IN SRV 20 0 5269 xmpp-server4.l.google.com.
+";
+		}
+	}
+	$dns_rec = $dbh->prepare
+		("SELECT LEFT(domainname,LENGTH(domainname)-LENGTH('.$domainname'))as sdn,rectype,data,enabled FROM dns_records 
+			WHERE domainname LIKE '%.$domainname' ORDER BY id;");
+	    $dns_rec->execute();
+	    while (my @val = $dns_rec->fetchrow_array()){
+	    	if ($val[3]>0){
+			my $rname = $val[0];
+			my $rtype = $val[1];
+			my $rdata = $val[2];
+			print DZONE "$rname\t\tIN\t$rtype\t$rdata\n";
+		}
+	    }
+	    if ($www>0) { print DZONE "www             IN      CNAME   $domainname.\n"; 
+	                  print DZONE "ww              IN      CNAME   $domainname.\n";
+			  print DZONE "wwww            IN      CNAME   $domainname.\n"; }
+	    if ($ftp>0) { print DZONE "ftp             IN      CNAME   $domainname.\n"; }
+	$dns_sub = $dbh->prepare
+		("SELECT subdomain,enable FROM dns_subgmail 
+			WHERE  enable>0 AND domainname LIKE '$domainname'  ORDER BY id;");
+	$dns_sub->execute();
+	while (my @val = $dns_sub->fetchrow_array()){
+		my $subdom = $val[0];
+		print DZONE
+"$subdom                IN      MX      1 ASPMX.L.GOOGLE.COM.
+$subdom                IN      MX      5 ALT1.ASPMX.L.GOOGLE.COM.
+$subdom                IN      MX      5 ALT2.ASPMX.L.GOOGLE.COM.
+$subdom                IN      MX      10 ASPMX2.GOOGLEMAIL.COM.
+$subdom                IN      MX      10 ASPMX3.GOOGLEMAIL.COM.
+$subdom                IN      MX      10 ASPMX4.GOOGLEMAIL.COM.
+$subdom                IN      MX      10 ASPMX5.GOOGLEMAIL.COM.
+$subdom                IN      TXT     \"v=spf1 include:aspmx.googlemail.com ~all\"
+mail.$subdom           IN      CNAME   ghs.google.com.
+calendar.$subdom        IN      CNAME   ghs.google.com.
+start.$subdom           IN      CNAME   ghs.google.com.
+docs.$subdom            IN      CNAME   ghs.google.com.
+_xmpp-server._tcp.$subdom.$domainname. IN SRV 5 0 5269 xmpp-server.l.google.com.
+_xmpp-server._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server1.l.google.com.
+_xmpp-server._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server2.l.google.com.
+_xmpp-server._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server3.l.google.com.
+_xmpp-server._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server4.l.google.com.
+_jabber._tcp.$subdom.$domainname. IN SRV 5 0 5269 xmpp-server.l.google.com.
+_jabber._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server1.l.google.com.
+_jabber._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server2.l.google.com.
+_jabber._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server3.l.google.com.
+_jabber._tcp.$subdom.$domainname. IN SRV 20 0 5269 xmpp-server4.l.google.com.
+";
+	}
+	print DZONE "\n";
+	close(DZONE);
+	}
+    }
+    $restartBind=1;    
+}
+
+
+sub mkrestart{
+    my $err=0;
+    if ($restartApache >= 1){
+	print LOG "Restarting Apache ";
+	system('/etc/init.d/apache2','restart');
+	print $?."\n";
+	$err+=$?;
+	print LOG "OK\n";
+    }
+
+    if ($restartPostfix >= 1){
+	print LOG "Restarting PostFix ";
+	system('/etc/init.d/postfix','restart');
+	print $?."\n";
+	$err+=$?;
+	print LOG "OK\n";
+    }
+
+    if ($restartBind >= 1){
+	print LOG "Restarting named ";
+	system('/etc/init.d/bind9','restart');
+	print $?."\n";
+	$err+=$?;
+	system('rsync -zavPO --delete-after --bwlimit=100 --progress -e "ssh -i /home/websync/.ssh/id_rsa" /opt/office_bind_conf/ websync@my.office.com.:/srv/www_mid/slave_bind_conf/');
+	print LOG "OK\n";
+    }
+print "Error code:$err\n";
+    return $err;
+}
+
+sync_passwd_http;
+make_vhosts_conf;
+make_vhosts_conf_alias;
+rotate_mail;
+make_hosts_conf;
+sync_dns_files;
+#print `chmod -Rc 770 /var/www/vhosts/*/www/ii/*`;
+#print `chmod -Rc 770 /var/www/vhosts/*/www/i/File/`;
+#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Flash/`;
+#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Image/`;
+#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Media/`;
+system("cat $backup_tmp | gzip -9 > '/opt/iadmin/backups/$bdate.cpio.gz'");
+
+if (mkrestart){
+    print "switch to old config";
+    system("cpio -iu --absolute-filenames < $backup_tmp");
+    if (mkrestart) {print "\nFATAL ERROR!!!\n";}
+}
+
+close (LOG);
+`rm -f $lock`;
+`rm -f $backup_tmp`;
+`rm /tmp/vhosts.conf`;
+`rm /tmp/*.zone`;
