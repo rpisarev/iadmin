@@ -568,11 +568,6 @@ make_vhosts_conf_alias;
 rotate_mail;
 make_hosts_conf;
 sync_dns_files;
-#print `chmod -Rc 770 /var/www/vhosts/*/www/ii/*`;
-#print `chmod -Rc 770 /var/www/vhosts/*/www/i/File/`;
-#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Flash/`;
-#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Image/`;
-#print `chmod -Rc 770 /var/www/vhosts/*/www/i/Media/`;
 system("cat $backup_tmp | gzip -9 > '/opt/iadmin/backups/$bdate.cpio.gz'");
 
 if (mkrestart){
